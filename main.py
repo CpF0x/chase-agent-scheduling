@@ -8,7 +8,7 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from after_project.cli import main
+from project.cli import main
 
 
 if __name__ == "__main__":

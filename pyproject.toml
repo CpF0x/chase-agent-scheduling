@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.10"
 
 [project.scripts]
-chase-exp = "after_project.cli:main"
+chase-exp = "project.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

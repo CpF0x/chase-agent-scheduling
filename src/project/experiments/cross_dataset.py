@@ -19,8 +19,8 @@ import random
 import multiprocessing
 from functools import partial
 
-from after_project.config import FIGURES_DIR
-from after_project.experiments import main_experiment as M
+from project.config import FIGURES_DIR
+from project.experiments import main_experiment as M
 
 # Experiment settings
 N_AGENTS       = 40

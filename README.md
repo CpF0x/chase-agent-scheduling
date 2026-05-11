@@ -2,13 +2,13 @@
 
 This repository contains the experiment code for CHASE, a congestion-aware
 task scheduling method for heterogeneous edge agents. The code is organized as
-a Python package under `src/after_project` with thin compatibility scripts in
+a Python package under `src/project` with thin compatibility scripts in
 the repository root.
 
 ## Repository Layout
 
 ```text
-src/after_project/
+src/project/
   config.py                 shared paths and experiment constants
   data.py                   trace loading and environment construction helpers
   models.py                 Agent and Task public imports
@@ -59,10 +59,10 @@ where possible. FL-DRL runs require the model file.
 Recommended package entry points:
 
 ```powershell
-python -m after_project.experiments.main_experiment
-python -m after_project.experiments.timecost
-python -m after_project.experiments.cross_dataset
-python -m after_project.experiments.sensitivity
+python -m project.experiments.main_experiment
+python -m project.experiments.timecost
+python -m project.experiments.cross_dataset
+python -m project.experiments.sensitivity
 ```
 
 CLI:

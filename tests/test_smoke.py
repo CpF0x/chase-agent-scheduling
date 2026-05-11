@@ -1,4 +1,4 @@
-from after_project.experiments import main_experiment as exp
+from project.experiments import main_experiment as exp
 
 
 def test_revenue_model_returns_float() -> None:

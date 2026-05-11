@@ -1,6 +1,6 @@
 """Timing, efficiency, and revenue model helpers."""
 
-from after_project.experiments.main_experiment import (
+from project.experiments.main_experiment import (
     calc_cpi_efficiency,
     calc_degradation,
     calc_dynamic_output,

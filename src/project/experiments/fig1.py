@@ -26,7 +26,7 @@ import pandas as pd
 import multiprocessing
 from functools import partial
 
-from after_project.config import FIGURES_DIR, TABLES_DIR
+from project.config import FIGURES_DIR, TABLES_DIR
 
 
 

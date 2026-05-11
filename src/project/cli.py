@@ -22,7 +22,7 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
 
     if args.command == "main":
-        from after_project.experiments import main_experiment
+        from project.experiments import main_experiment
 
         if args.quick:
             main_experiment.run_quick_smoke()
@@ -33,13 +33,13 @@ def main(argv: list[str] | None = None) -> None:
         return
 
     if args.command == "timecost":
-        from after_project.experiments.timecost import main as run
+        from project.experiments.timecost import main as run
     elif args.command == "cross-dataset":
-        from after_project.experiments.cross_dataset import main as run
+        from project.experiments.cross_dataset import main as run
     elif args.command == "sensitivity":
-        from after_project.experiments.sensitivity import main as run
+        from project.experiments.sensitivity import main as run
     else:
-        from after_project.experiments.fig1 import main as run
+        from project.experiments.fig1 import main as run
 
     run()
 

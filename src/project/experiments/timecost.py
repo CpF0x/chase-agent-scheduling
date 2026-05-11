@@ -32,8 +32,8 @@ from functools import partial
 
 # Shared imports
 
-from after_project.config import FIGURES_DIR
-from after_project.experiments.main_experiment import (
+from project.config import FIGURES_DIR
+from project.experiments.main_experiment import (
     CAP_HIGH, CAP_MID, CAP_LOW,
     REAL_TRACE_PATH,
     load_real_trace_data,

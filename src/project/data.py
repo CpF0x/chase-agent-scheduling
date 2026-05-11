@@ -1,6 +1,6 @@
 """Dataset loading and synthetic environment construction helpers."""
 
-from after_project.experiments.main_experiment import (
+from project.experiments.main_experiment import (
     create_agents_from_real_data,
     create_tasks_from_real_data,
     load_agent_distribution,

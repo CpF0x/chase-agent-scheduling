@@ -9,7 +9,7 @@ import time
 import pandas as pd
 import ast
 
-from after_project.config import BORG_TRACE_PATH, FIGURES_DIR, FL_DRL_MODEL_PATH as DEFAULT_MODEL_PATH, TABLES_DIR
+from project.config import BORG_TRACE_PATH, FIGURES_DIR, FL_DRL_MODEL_PATH as DEFAULT_MODEL_PATH, TABLES_DIR
 
 
 # FL-DRL model cache
@@ -22,7 +22,7 @@ def get_fl_drl_model():
 
     global _FL_DRL_MODEL
     if _FL_DRL_MODEL is None:
-        from after_project.algorithms.fldrl import FLDRLInference
+        from project.algorithms.fldrl import FLDRLInference
         _FL_DRL_MODEL = FLDRLInference(FL_DRL_MODEL_PATH)
     return _FL_DRL_MODEL
 
@@ -2572,6 +2572,6 @@ if __name__ == '__main__':
 
     multiprocessing.freeze_support()
 
-    from after_project.cli import main as cli_main
+    from project.cli import main as cli_main
 
     cli_main()
