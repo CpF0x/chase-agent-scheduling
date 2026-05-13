@@ -2049,7 +2049,7 @@ def _run_chase_group(agents, tasks, skip_congestion=False, skip_repick=False, ra
     assignment = _empty_assignment(agents)
     tabu = defaultdict(set)
 
-    for task in tasks:
+    for task in sorted(tasks, key=lambda task: task.wk):
         group = tas_find_group(
             task,
             agents,
