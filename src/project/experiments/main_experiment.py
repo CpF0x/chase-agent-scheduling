@@ -172,6 +172,10 @@ TASK_NUM_RANGE = [20, 40, 60, 80, 100, 120]
 
 
 DEADLINE = 0.9
+HIGH_PRESSURE_DEADLINE = 0.75
+HIGH_PRESSURE_WORKLOAD_SCALE = 1.15
+HIGH_PRESSURE_TRIALS = 30
+HIGH_PRESSURE_ALGORITHMS = ["CHASE", "BRTOA", "MCT", "IRS", "DyLAN"]
 
 
 
@@ -882,6 +886,26 @@ def remove_live_records(agents, records):
         agent.current_load = max(0.0, agent.current_load)
 
 
+def clone_tasks_for_scenario(tasks, deadline=DEADLINE, workload_scale=1.0):
+    """Clone tasks with scaled subtask workloads and a scenario deadline."""
+    cloned = []
+    for task in tasks:
+        subtasks = [
+            Subtask(
+                task.id,
+                subtask.id,
+                subtask.skill,
+                subtask.wk * workload_scale,
+                subtask.cpi,
+            )
+            for subtask in task.subtasks
+        ]
+        new_task = Task(task.id, real_cpi=task.cpi, subtasks=subtasks)
+        new_task.deadline = deadline
+        cloned.append(new_task)
+    return cloned
+
+
 def create_tasks_from_real_data(n_tasks, real_data=None):
 
 
@@ -1088,10 +1112,16 @@ def _score_subtask_agent(subtask, agent, agent_records, skip_congestion=False):
 
     real_t = calc_subtask_real_time(subtask, agent, new_conc, new_total_load)
     time_margin = max(0.0, (DEADLINE - real_t) / DEADLINE)
-    load_penalty = current_load * 0.35
-    conc_penalty = max(0, new_conc - 1) * 0.12
-    skill_bonus = agent.skill_efficiency.get(subtask.skill, 0.0) * 0.15
-    return time_margin + skill_bonus - load_penalty - conc_penalty
+    headroom = 1.0 - new_total_load
+    skill_bonus = agent.skill_efficiency.get(subtask.skill, 0.0)
+
+    return (
+        -real_t * 1.6
+        + time_margin * 0.7
+        + skill_bonus * 0.08
+        + headroom * 0.03
+        - max(0, new_conc - 1) * 0.03
+    )
 
 
 def find_agent_for_subtask(task, subtask, agents, assignment, tentative=None, tabu=None,
@@ -1952,6 +1982,36 @@ def _record_marginal_value(record, assignment):
     return current - after
 
 
+def _record_drop_cost(record, agents, assignment, tabu):
+    involved_tasks = _unique_tasks(assignment.get(record.agent.id, []))
+    if record.task not in involved_tasks:
+        involved_tasks.append(record.task)
+
+    current = sum(_task_revenue_from_assignment(task, assignment) for task in involved_tasks)
+    temp = clone_assignment(assignment)
+    _remove_record(temp, record)
+
+    task_tabu = set(tabu[record.task.id])
+    task_tabu.add(record.agent.id)
+    replacement_agent = find_agent_for_subtask(
+        record.task,
+        record.subtask,
+        agents,
+        temp,
+        tabu=task_tabu,
+        skip_congestion=False,
+    )
+
+    if replacement_agent is None:
+        remove_task_from_assignment(temp, record.task.id)
+    else:
+        replacement = SubtaskAssignment(record.task, record.subtask, replacement_agent)
+        _append_record(temp, replacement)
+
+    after = sum(_task_revenue_from_assignment(task, temp) for task in involved_tasks)
+    return current - after
+
+
 def _replace_or_remove_record(record, agents, assignment, tabu, skip_repick=False):
     _remove_record(assignment, record)
     tabu[record.task.id].add(record.agent.id)
@@ -2017,7 +2077,10 @@ def _run_chase_group(agents, tasks, skip_congestion=False, skip_repick=False, ra
                 if random_drop:
                     dropped = random.choice(records)
                 else:
-                    dropped = min(records, key=lambda rec: _record_marginal_value(rec, assignment))
+                    dropped = min(
+                        records,
+                        key=lambda rec: _record_drop_cost(rec, agents, assignment, tabu),
+                    )
                 _, changed_agents = _replace_or_remove_record(
                     dropped,
                     agents,
@@ -2191,10 +2254,60 @@ class DyLAN:
         self.E_layers = []
         self.messages = []
 
+    def _agent_contributions(self, active_agents, assignment):
+        raw = {
+            agent.id: max(0.0, _agent_joint_revenue(agent.id, assignment))
+            for agent in active_agents
+        }
+        total = sum(raw.values())
+        if total <= 0:
+            return {agent.id: 0.0 for agent in active_agents}
+        return {agent_id: value / total for agent_id, value in raw.items()}
+
+    def _dylan_find_group(self, task, active_agents, assignment, contributions):
+        tentative = []
+        for subtask in task.subtasks:
+            used_agents = assigned_agent_ids_for_task(assignment, task)
+            used_agents.update(record.agent.id for record in tentative)
+            candidates = []
+
+            for agent in active_agents:
+                if agent.id in used_agents or not agent.can_execute(subtask.skill):
+                    continue
+
+                agent_records = list(assignment.get(agent.id, []))
+                agent_records.extend(record for record in tentative if record.agent.id == agent.id)
+                current_load = _agent_load_from_records(agent, agent_records)
+                omega = subtask.wk / agent.capacity
+                if current_load + omega > 1.0:
+                    continue
+
+                contribution = contributions.get(agent.id, 0.0)
+                skill_fit = agent.skill_efficiency.get(subtask.skill, 0.0)
+                capacity_hint = agent.capacity / CAP_HIGH
+                load_balance = 1.0 - current_load
+                score = contribution * 1.2 + skill_fit * 0.45 + capacity_hint * 0.25 + load_balance * 0.10
+                candidates.append((score, agent))
+
+            if not candidates:
+                return None
+            candidates.sort(key=lambda item: item[0], reverse=True)
+            tentative.append(SubtaskAssignment(task, subtask, candidates[0][1]))
+
+        return tentative
+
     def _schedule_on_active_agents(self, active_agents):
         assignment = {agent.id: [] for agent in active_agents}
+        max_base = max(
+            (agent.capacity * len(agent.skills) for agent in active_agents),
+            default=1.0,
+        )
+        contributions = {
+            agent.id: (agent.capacity * len(agent.skills)) / max_base
+            for agent in active_agents
+        }
         for task in sorted(self.tasks, key=lambda t: t.wk):
-            group = _mct_find_group(task, active_agents, assignment)
+            group = self._dylan_find_group(task, active_agents, assignment, contributions)
             if group:
                 commit_group_assignment(assignment, group)
         return assignment
@@ -2384,6 +2497,97 @@ def _worker_scale(n_agent, n_task, trial_idx, real_trace_data=None, real_agent_d
         'FL_DRL': run_algorithm('FL_DRL', agents, tasks),
         'BRTOA':  run_algorithm('BRTOA',  agents, tasks)
     }
+
+
+def _run_algorithms_no_fldrl(base_agents, tasks, algorithms=None):
+    algorithms = algorithms or HIGH_PRESSURE_ALGORITHMS
+    results = {}
+    for alg in algorithms:
+        fresh_agents = [
+            Agent(agent.id, agent.type, agent.capacity, agent.output)
+            for agent in base_agents
+        ]
+        results[alg] = run_algorithm(alg, fresh_agents, tasks)
+    return results
+
+
+def _worker_high_pressure(n_task, trial_idx, real_trace_data=None, real_agent_dist=None,
+                          deadline=HIGH_PRESSURE_DEADLINE,
+                          workload_scale=HIGH_PRESSURE_WORKLOAD_SCALE):
+    random.seed()
+    np.random.seed()
+
+    base_agents = create_agents_from_real_data(AGENT_COUNT, real_distribution=real_agent_dist)
+    base_tasks = create_tasks_from_real_data(n_task, real_data=real_trace_data)
+    tasks = clone_tasks_for_scenario(
+        base_tasks,
+        deadline=deadline,
+        workload_scale=workload_scale,
+    )
+    return _run_algorithms_no_fldrl(base_agents, tasks)
+
+
+def run_high_pressure_experiment(num_trials=HIGH_PRESSURE_TRIALS,
+                                 task_nums=None,
+                                 deadline=HIGH_PRESSURE_DEADLINE,
+                                 workload_scale=HIGH_PRESSURE_WORKLOAD_SCALE):
+    task_nums = task_nums or TASK_NUM_RANGE
+    print(">>> Running high-pressure experiment (no FL-DRL)")
+    print(f"    deadline={deadline}, workload_scale={workload_scale}, trials={num_trials}")
+
+    real_trace_data = load_real_trace_data()
+    real_agent_dist = load_agent_distribution()
+    stats = {
+        "scenario": {
+            "deadline": deadline,
+            "workload_scale": workload_scale,
+            "trials": num_trials,
+        },
+        "tasks": list(task_nums),
+        "algorithms": list(HIGH_PRESSURE_ALGORITHMS),
+        "results": {},
+    }
+
+    for n_task in task_nums:
+        buckets = {
+            alg: {"revenue": [], "success_rate": [], "time": []}
+            for alg in HIGH_PRESSURE_ALGORITHMS
+        }
+        for trial_idx in range(num_trials):
+            random.seed(20260518 + trial_idx + n_task * 31)
+            np.random.seed(20260518 + trial_idx + n_task * 31)
+            base_agents = create_agents_from_real_data(AGENT_COUNT, real_distribution=real_agent_dist)
+            base_tasks = create_tasks_from_real_data(n_task, real_data=real_trace_data)
+            tasks = clone_tasks_for_scenario(
+                base_tasks,
+                deadline=deadline,
+                workload_scale=workload_scale,
+            )
+            trial_results = _run_algorithms_no_fldrl(base_agents, tasks)
+            for alg, result in trial_results.items():
+                for metric in buckets[alg]:
+                    buckets[alg][metric].append(result[metric])
+
+        stats["results"][n_task] = {}
+        for alg in HIGH_PRESSURE_ALGORITHMS:
+            stats["results"][n_task][alg] = {}
+            for metric, values in buckets[alg].items():
+                arr = np.array(values)
+                stats["results"][n_task][alg][metric] = {
+                    "mean": float(np.mean(arr)),
+                    "std": float(np.std(arr, ddof=1)) if len(arr) > 1 else 0.0,
+                }
+
+        print(f"  Tasks={n_task}")
+        for alg in HIGH_PRESSURE_ALGORITHMS:
+            row = stats["results"][n_task][alg]
+            print(
+                f"    {alg:5s} revenue={row['revenue']['mean']:8.1f} "
+                f"success={row['success_rate']['mean'] * 100:6.1f}% "
+                f"time={row['time']['mean']:8.2f} ms"
+            )
+
+    return stats
 
 
 def run_full_experiment():

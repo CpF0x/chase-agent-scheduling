@@ -73,6 +73,7 @@ chase-exp timecost
 chase-exp cross-dataset
 chase-exp sensitivity
 chase-exp main --quick
+chase-exp high-pressure
 ```
 
 Compatibility scripts still work:

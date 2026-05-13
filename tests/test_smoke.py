@@ -85,3 +85,14 @@ def test_fldrl_training_env_uses_subtask_skill_mask() -> None:
     for idx, agent in enumerate(env.agents):
         if not agent.can_execute(subtask.skill):
             assert not mask[idx]
+
+
+def test_high_pressure_task_clone_scales_subtasks_and_deadline() -> None:
+    task = exp.Task(7, real_workload=70, real_cpi=2.0)
+    cloned = exp.clone_tasks_for_scenario([task], deadline=0.75, workload_scale=1.15)[0]
+
+    assert cloned.deadline == 0.75
+    assert abs(cloned.wk - task.wk * 1.15) < 1e-9
+    for original, scaled in zip(task.subtasks, cloned.subtasks, strict=True):
+        assert original.skill == scaled.skill
+        assert abs(scaled.wk - original.wk * 1.15) < 1e-9
