@@ -30,11 +30,16 @@ def test_core_algorithms_return_expected_metrics() -> None:
 
 def test_agents_and_tasks_expose_skills_and_subtasks() -> None:
     agent = exp.Agent(0, "Mid", 70, 35)
-    task = exp.Task(0, real_workload=65, real_cpi=2.0)
+    task = exp.Task(12, real_workload=65, real_cpi=2.0)
 
     assert agent.skills
     assert set(agent.skills) <= set(agent.skill_efficiency)
+    assert exp.Agent(0, "Low", 25, 12.5).skills == ("sense", "actuate")
+    assert exp.Agent(1, "Mid", 70, 35).skills == ("sense", "preprocess", "aggregate")
+    assert exp.Agent(2, "High", 120, 60).skills == ("preprocess", "infer", "aggregate")
     assert task.subtasks
+    assert task.task_type == "Control"
+    assert task.required_skills == ("sense", "preprocess", "infer", "actuate")
     assert set(task.required_skills) == {subtask.skill for subtask in task.subtasks}
     assert abs(sum(subtask.wk for subtask in task.subtasks) - task.wk) < 1e-9
 

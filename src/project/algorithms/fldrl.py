@@ -15,7 +15,7 @@ torch.set_num_threads(1)
 import torch.nn as nn
 import numpy as np
 
-SKILL_NAMES = ("sensing", "compute", "control")
+SKILL_NAMES = ("sense", "preprocess", "infer", "aggregate", "actuate")
 
 
 class DDQNNetwork(nn.Module):

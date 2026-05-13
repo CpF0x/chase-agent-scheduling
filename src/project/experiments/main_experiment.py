@@ -200,31 +200,41 @@ AGENTS_CONFIG = [
     {'type': 'Low',  'cap': CAP_LOW,  'count': 12, 'output': CAP_LOW*0.5}
 ]
 
-SKILL_NAMES = ("sensing", "compute", "control")
+SKILL_NAMES = ("sense", "preprocess", "infer", "aggregate", "actuate")
 SKILL_INDEX = {name: idx for idx, name in enumerate(SKILL_NAMES)}
 
 AGENT_SKILLS_BY_TYPE = {
-    "High": SKILL_NAMES,
-    "Mid": ("sensing", "compute"),
-    "Low": ("sensing", "control"),
+    "High": ("preprocess", "infer", "aggregate"),
+    "Mid": ("sense", "preprocess", "aggregate"),
+    "Low": ("sense", "actuate"),
 }
 
 SKILL_EFFICIENCY_BY_TYPE = {
-    "High": {"sensing": 1.00, "compute": 1.00, "control": 0.95},
-    "Mid": {"sensing": 0.90, "compute": 0.85},
-    "Low": {"sensing": 0.75, "control": 0.70},
+    "High": {"preprocess": 0.95, "infer": 1.00, "aggregate": 0.90},
+    "Mid": {"sense": 0.90, "preprocess": 0.85, "aggregate": 0.80},
+    "Low": {"sense": 0.78, "actuate": 0.82},
 }
 
-TASK_SKILL_TEMPLATES = {
-    1: (("sensing",), ("compute",), ("control",)),
-    2: (("sensing", "compute"), ("sensing", "control"), ("compute", "control")),
-    3: (("sensing", "compute", "control"),),
+TASK_TEMPLATES = {
+    "Monitoring": ("sense", "aggregate"),
+    "Perception": ("sense", "preprocess", "infer"),
+    "Control": ("sense", "preprocess", "infer", "actuate"),
+    "Fusion": ("sense", "preprocess", "aggregate", "infer"),
 }
 
-SUBTASK_SPLITS = {
-    1: (1.0,),
-    2: (0.55, 0.45),
-    3: (0.40, 0.35, 0.25),
+TASK_TYPE_SEQUENCE = (
+    ["Monitoring"] * 5
+    + ["Perception"] * 7
+    + ["Control"] * 5
+    + ["Fusion"] * 3
+)
+
+SKILL_WORKLOAD_WEIGHTS = {
+    "sense": 0.10,
+    "preprocess": 0.20,
+    "infer": 0.45,
+    "aggregate": 0.15,
+    "actuate": 0.10,
 }
 
 
@@ -507,7 +517,7 @@ WORKLOAD_RANGE = (25, 80)
 
 
 def _default_agent_skills(atype):
-    return tuple(AGENT_SKILLS_BY_TYPE.get(atype, ("sensing",)))
+    return tuple(AGENT_SKILLS_BY_TYPE.get(atype, ("sense",)))
 
 
 def _default_skill_efficiency(atype, skills):
@@ -515,23 +525,20 @@ def _default_skill_efficiency(atype, skills):
     return {skill: float(template.get(skill, 0.65)) for skill in skills}
 
 
-def _required_skill_count(workload):
-    if workload <= 40:
-        return 1
-    if workload <= 60:
-        return 2
-    return 3
+def _select_task_type(task_id):
+    return TASK_TYPE_SEQUENCE[task_id % len(TASK_TYPE_SEQUENCE)]
 
 
-def _select_required_skills(task_id, workload):
-    count = _required_skill_count(workload)
-    templates = TASK_SKILL_TEMPLATES[count]
-    return tuple(templates[task_id % len(templates)])
+def _select_required_skills(task_id, workload=None):
+    return TASK_TEMPLATES[_select_task_type(task_id)]
 
 
-def _split_workload(total_workload, n_parts):
-    ratios = SUBTASK_SPLITS[n_parts]
-    pieces = [total_workload * ratio for ratio in ratios]
+def _split_workload_by_skill(total_workload, skills):
+    total_weight = sum(SKILL_WORKLOAD_WEIGHTS[skill] for skill in skills)
+    pieces = [
+        total_workload * SKILL_WORKLOAD_WEIGHTS[skill] / total_weight
+        for skill in skills
+    ]
     pieces[-1] += total_workload - sum(pieces)
     return pieces
 
@@ -604,8 +611,9 @@ class Task:
 
     DEFAULT_CPI = 2.0
 
-    def __init__(self, uid, real_workload=None, real_cpi=None, subtasks=None):
+    def __init__(self, uid, real_workload=None, real_cpi=None, subtasks=None, task_type=None):
         self.id = uid
+        self.task_type = task_type or _select_task_type(uid)
 
         if real_workload is not None:
             self.wk = float(real_workload)
@@ -618,8 +626,8 @@ class Task:
             self.cpi = Task.DEFAULT_CPI
 
         if subtasks is None:
-            required_skills = _select_required_skills(uid, self.wk)
-            workloads = _split_workload(self.wk, len(required_skills))
+            required_skills = TASK_TEMPLATES[self.task_type]
+            workloads = _split_workload_by_skill(self.wk, required_skills)
             self.subtasks = [
                 Subtask(uid, idx, skill, workloads[idx], self.cpi)
                 for idx, skill in enumerate(required_skills)
@@ -900,7 +908,7 @@ def clone_tasks_for_scenario(tasks, deadline=DEADLINE, workload_scale=1.0):
             )
             for subtask in task.subtasks
         ]
-        new_task = Task(task.id, real_cpi=task.cpi, subtasks=subtasks)
+        new_task = Task(task.id, real_cpi=task.cpi, subtasks=subtasks, task_type=task.task_type)
         new_task.deadline = deadline
         cloned.append(new_task)
     return cloned
