@@ -43,6 +43,33 @@ AGENT_DISTRIBUTION = {
     'Low':  {'ratio': 0.30, 'cap_range': (25, 49)},
 }
 
+SKILL_NAMES = ("sensing", "compute", "control")
+SKILL_INDEX = {name: idx for idx, name in enumerate(SKILL_NAMES)}
+
+AGENT_SKILLS_BY_TYPE = {
+    "High": SKILL_NAMES,
+    "Mid": ("sensing", "compute"),
+    "Low": ("sensing", "control"),
+}
+
+SKILL_EFFICIENCY_BY_TYPE = {
+    "High": {"sensing": 1.00, "compute": 1.00, "control": 0.95},
+    "Mid": {"sensing": 0.90, "compute": 0.85},
+    "Low": {"sensing": 0.75, "control": 0.70},
+}
+
+TASK_SKILL_TEMPLATES = {
+    1: (("sensing",), ("compute",), ("control",)),
+    2: (("sensing", "compute"), ("sensing", "control"), ("compute", "control")),
+    3: (("sensing", "compute", "control"),),
+}
+
+SUBTASK_SPLITS = {
+    1: (1.0,),
+    2: (0.55, 0.45),
+    3: (0.40, 0.35, 0.25),
+}
+
 
 CPI_MODEL_PARAMS = {
     'eta_max': 0.75,
@@ -60,8 +87,17 @@ class SimpleAgent:
         self.id = uid
         self.type = atype
         self.capacity = cap
+        self.skills = tuple(AGENT_SKILLS_BY_TYPE.get(atype, ("sensing",)))
+        efficiency_template = SKILL_EFFICIENCY_BY_TYPE.get(atype, {})
+        self.skill_efficiency = {
+            skill: float(efficiency_template.get(skill, 0.65))
+            for skill in self.skills
+        }
         self.current_load = 0.0
         self.concurrent_tasks = []
+
+    def can_execute(self, skill):
+        return skill in self.skills
 
     def reset(self):
         self.current_load = 0.0
@@ -76,14 +112,53 @@ def calc_tau(base_val, cost, delta, gamma):
     inner = max(1e-9, min(1.0 - 1e-9, inner))
     return (1.0 / delta) * math.log(inner / (1.0 - inner))
 
+class SimpleSubtask:
+    """Skill-specific training subtask."""
+
+    def __init__(self, task_id, index, skill, wk, cpi):
+        self.task_id = task_id
+        self.id = index
+        self.skill = skill
+        self.wk = float(wk)
+        self.cpi = float(cpi)
+
+
+def _required_skill_count(workload):
+    if workload <= 40:
+        return 1
+    if workload <= 60:
+        return 2
+    return 3
+
+
+def _select_required_skills(task_id, workload):
+    count = _required_skill_count(workload)
+    templates = TASK_SKILL_TEMPLATES[count]
+    return tuple(templates[task_id % len(templates)])
+
+
+def _split_workload(total_workload, n_parts):
+    ratios = SUBTASK_SPLITS[n_parts]
+    pieces = [total_workload * ratio for ratio in ratios]
+    pieces[-1] += total_workload - sum(pieces)
+    return pieces
+
+
 class SimpleTask:
     """Lightweight training task."""
     DEFAULT_CPI = 2.0
 
     def __init__(self, uid, wk=None, cpi=None):
         self.id = uid
-        self.wk = wk if wk is not None else random.uniform(*WORKLOAD_RANGE)
-        self.cpi = cpi if cpi is not None else max(0.4, self.DEFAULT_CPI + random.uniform(-0.3, 0.3))
+        self.wk = float(wk if wk is not None else random.uniform(*WORKLOAD_RANGE))
+        self.cpi = float(cpi if cpi is not None else max(0.4, self.DEFAULT_CPI + random.uniform(-0.3, 0.3)))
+        required_skills = _select_required_skills(uid, self.wk)
+        workloads = _split_workload(self.wk, len(required_skills))
+        self.subtasks = [
+            SimpleSubtask(uid, idx, skill, workloads[idx], self.cpi)
+            for idx, skill in enumerate(required_skills)
+        ]
+        self.required_skills = tuple(st.skill for st in self.subtasks)
         self.deadline = DEADLINE
         self.base_val = 100.0
         self.tau_k = calc_tau(self.base_val, REVENUE_COST, REVENUE_DELTA, REVENUE_GAMMA)
@@ -104,11 +179,13 @@ BETA_2 = 0.5
 BETA_3 = 0.1
 ALPHA_MAP = {'High': 0.2, 'Mid': 0.45, 'Low': 0.8}
 
-def calc_real_time_train(task, agent, concurrency, omega):
+def calc_real_time_train(work_item, agent, concurrency, omega):
 
-    eta = calc_cpi_efficiency(task.cpi)
-    dynamic_output = agent.capacity * eta
-    base_t = task.wk / dynamic_output
+    eta = calc_cpi_efficiency(work_item.cpi)
+    skill = getattr(work_item, "skill", None)
+    skill_multiplier = agent.skill_efficiency.get(skill, 1.0) if skill else 1.0
+    dynamic_output = max(1e-9, agent.capacity * eta * skill_multiplier)
+    base_t = work_item.wk / dynamic_output
     alpha = ALPHA_MAP.get(getattr(agent, 'type', 'Mid'), 0.45)
     f = BETA_1 * omega + BETA_2 * omega**2 + BETA_3 * max(0, concurrency - 1)
     return base_t * (1 + alpha * f)
@@ -168,7 +245,7 @@ def create_tasks(n_tasks):
 
 # Gym-style scheduling environment
 
-class TaskSchedulingEnv:
+class _LegacyTaskSchedulingEnv:
     """Scheduling environment for DDQN training."""
 
 
@@ -262,6 +339,136 @@ class TaskSchedulingEnv:
 
         return next_state, reward, done
 
+
+
+class TaskSchedulingEnv:
+    """Skill/subtask-aware scheduling environment for DDQN training."""
+
+    def __init__(self, n_agents=AGENT_COUNT):
+        self.n_agents = n_agents
+        self.state_dim = 2 + len(SKILL_NAMES) + 1 + 3 * n_agents
+        self.action_dim = n_agents
+
+    def reset(self, n_tasks=None):
+        if n_tasks is None:
+            n_tasks = random.choice([60, 80, 100, 120])
+        self.agents = create_agents(self.n_agents)
+        self.tasks = sorted(create_tasks(n_tasks), key=lambda t: t.wk)
+        self.current_idx = 0
+        self.current_subtask_idx = 0
+        self.task_records = {}
+        self.total_revenue = 0
+        self.success_count = 0
+        return self._get_state()
+
+    def _current_task_and_subtask(self):
+        if self.current_idx >= len(self.tasks):
+            return None, None
+        task = self.tasks[self.current_idx]
+        return task, task.subtasks[self.current_subtask_idx]
+
+    def _get_state(self):
+        if self.current_idx >= len(self.tasks):
+            return np.zeros(self.state_dim, dtype=np.float32)
+
+        task, subtask = self._current_task_and_subtask()
+        progress = self.current_subtask_idx / max(1, len(task.subtasks))
+        state = [subtask.wk / 80.0, subtask.cpi / 4.0]
+        state.extend(1.0 if subtask.skill == skill else 0.0 for skill in SKILL_NAMES)
+        state.append(progress)
+        for ag in self.agents:
+            state.append(ag.current_load)
+            state.append(ag.capacity / 120.0)
+            state.append(1.0 if ag.can_execute(subtask.skill) else 0.0)
+        return np.array(state, dtype=np.float32)
+
+    def get_feasible_mask(self):
+        if self.current_idx >= len(self.tasks):
+            return np.zeros(self.n_agents, dtype=bool)
+
+        task, subtask = self._current_task_and_subtask()
+        used_agents = {record["agent_id"] for record in self.task_records.get(task.id, [])}
+        mask = np.zeros(self.n_agents, dtype=bool)
+        for i, ag in enumerate(self.agents):
+            omega = subtask.wk / ag.capacity
+            if (
+                ag.id not in used_agents
+                and ag.can_execute(subtask.skill)
+                and ag.current_load + omega <= 1.0
+            ):
+                mask[i] = True
+        return mask
+
+    def _finish_current_subtask(self):
+        task = self.tasks[self.current_idx]
+        self.current_subtask_idx += 1
+        if self.current_subtask_idx >= len(task.subtasks):
+            self.current_idx += 1
+            self.current_subtask_idx = 0
+
+    def _rollback_task(self, task):
+        records = self.task_records.pop(task.id, [])
+        for record in records:
+            agent = self.agents[record["agent_id"]]
+            agent.current_load = max(0.0, agent.current_load - record["load"])
+            agent.concurrent_tasks = [
+                item
+                for item in agent.concurrent_tasks
+                if not (
+                    item["task_id"] == task.id
+                    and item["subtask_id"] == record["subtask_id"]
+                )
+            ]
+
+    def _task_completion_time(self, task):
+        records = self.task_records.get(task.id, [])
+        if len(records) < len(task.subtasks):
+            return float("inf")
+        times = []
+        for record in records:
+            agent = self.agents[record["agent_id"]]
+            subtask = task.subtasks[record["subtask_id"]]
+            times.append(calc_real_time_train(subtask, agent, len(agent.concurrent_tasks), agent.current_load))
+        return max(times) if times else float("inf")
+
+    def step(self, action):
+        task, subtask = self._current_task_and_subtask()
+        agent = self.agents[action]
+        mask = self.get_feasible_mask()
+        omega = subtask.wk / agent.capacity
+
+        if mask[action]:
+            agent.current_load += omega
+            record = {
+                "task_id": task.id,
+                "subtask_id": subtask.id,
+                "agent_id": agent.id,
+                "load": omega,
+            }
+            agent.concurrent_tasks.append(record)
+            self.task_records.setdefault(task.id, []).append(record)
+
+            reward = 0.25
+            if self.current_subtask_idx == len(task.subtasks) - 1:
+                real_t = self._task_completion_time(task)
+                if real_t <= task.deadline:
+                    self.success_count += 1
+                    self.total_revenue += task.base_val
+                    margin = (task.deadline - real_t) / task.deadline
+                    reward = 5.0 + 5.0 * margin
+                else:
+                    overtime = (real_t - task.deadline) / task.deadline
+                    reward = -5.0 * min(overtime, 2.0)
+            self._finish_current_subtask()
+        else:
+            self._rollback_task(task)
+            reward = -5.0
+            self.current_idx += 1
+            self.current_subtask_idx = 0
+
+        done = self.current_idx >= len(self.tasks)
+        next_state = self._get_state()
+        return next_state, reward, done
 
 
 # DDQN model
@@ -617,6 +824,7 @@ class FLDRLTrainer:
             'state_dim': self.env.state_dim,
             'action_dim': self.env.action_dim,
             'n_agents': self.n_agents,
+            'skill_names': SKILL_NAMES,
             'hidden_size': 200,
         }, path)
 

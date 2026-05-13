@@ -8,6 +8,7 @@ import random
 import time
 import pandas as pd
 import ast
+from collections import defaultdict
 
 from project.config import BORG_TRACE_PATH, FIGURES_DIR, FL_DRL_MODEL_PATH as DEFAULT_MODEL_PATH, TABLES_DIR
 
@@ -29,7 +30,7 @@ def get_fl_drl_model():
 
 # BRTOA baseline
 
-class Baseline_BRTOA:
+class _LegacyBaseline_BRTOA:
     """Best-response baseline solver."""
 
 
@@ -194,6 +195,33 @@ AGENTS_CONFIG = [
     {'type': 'Mid',  'cap': CAP_MID,  'count': 10, 'output': CAP_MID*0.5},
     {'type': 'Low',  'cap': CAP_LOW,  'count': 12, 'output': CAP_LOW*0.5}
 ]
+
+SKILL_NAMES = ("sensing", "compute", "control")
+SKILL_INDEX = {name: idx for idx, name in enumerate(SKILL_NAMES)}
+
+AGENT_SKILLS_BY_TYPE = {
+    "High": SKILL_NAMES,
+    "Mid": ("sensing", "compute"),
+    "Low": ("sensing", "control"),
+}
+
+SKILL_EFFICIENCY_BY_TYPE = {
+    "High": {"sensing": 1.00, "compute": 1.00, "control": 0.95},
+    "Mid": {"sensing": 0.90, "compute": 0.85},
+    "Low": {"sensing": 0.75, "control": 0.70},
+}
+
+TASK_SKILL_TEMPLATES = {
+    1: (("sensing",), ("compute",), ("control",)),
+    2: (("sensing", "compute"), ("sensing", "control"), ("compute", "control")),
+    3: (("sensing", "compute", "control"),),
+}
+
+SUBTASK_SPLITS = {
+    1: (1.0,),
+    2: (0.55, 0.45),
+    3: (0.40, 0.35, 0.25),
+}
 
 
 # Alibaba trace data
@@ -473,46 +501,130 @@ WORKLOAD_RANGE = (25, 80)
 
 # Basic entities
 
+
+def _default_agent_skills(atype):
+    return tuple(AGENT_SKILLS_BY_TYPE.get(atype, ("sensing",)))
+
+
+def _default_skill_efficiency(atype, skills):
+    template = SKILL_EFFICIENCY_BY_TYPE.get(atype, {})
+    return {skill: float(template.get(skill, 0.65)) for skill in skills}
+
+
+def _required_skill_count(workload):
+    if workload <= 40:
+        return 1
+    if workload <= 60:
+        return 2
+    return 3
+
+
+def _select_required_skills(task_id, workload):
+    count = _required_skill_count(workload)
+    templates = TASK_SKILL_TEMPLATES[count]
+    return tuple(templates[task_id % len(templates)])
+
+
+def _split_workload(total_workload, n_parts):
+    ratios = SUBTASK_SPLITS[n_parts]
+    pieces = [total_workload * ratio for ratio in ratios]
+    pieces[-1] += total_workload - sum(pieces)
+    return pieces
+
+
+class Subtask:
+    """Skill-specific unit inside a complex task."""
+
+    def __init__(self, task_id, index, skill, workload, cpi):
+        self.task_id = task_id
+        self.id = index
+        self.skill = skill
+        self.wk = float(workload)
+        self.cpi = float(cpi)
+
+    @property
+    def key(self):
+        return (self.task_id, self.id)
+
+
+class SubtaskAssignment:
+    """Assignment record for one agent-role decision."""
+
+    def __init__(self, task, subtask, agent):
+        self.task = task
+        self.subtask = subtask
+        self.agent = agent
+
+    @property
+    def task_id(self):
+        return self.task.id
+
+    @property
+    def subtask_id(self):
+        return self.subtask.id
+
+    @property
+    def skill(self):
+        return self.subtask.skill
+
+    @property
+    def wk(self):
+        return self.subtask.wk
+
+
 class Agent:
-    def __init__(self, uid, atype, cap, output):
+    def __init__(self, uid, atype, cap, output, skills=None, skill_efficiency=None):
         self.id = uid
         self.type = atype
         self.capacity = cap
         self.output = output
+        self.skills = tuple(skills) if skills is not None else _default_agent_skills(atype)
+        self.skill_efficiency = (
+            dict(skill_efficiency)
+            if skill_efficiency is not None
+            else _default_skill_efficiency(atype, self.skills)
+        )
         self.current_load = 0.0
         self.concurrent_tasks = []
+
+    def can_execute(self, skill):
+        return skill in self.skills
 
     def reset(self):
         self.current_load = 0.0
         self.concurrent_tasks = []
 
+
 class Task:
-    """Task model used by the experiments."""
-
-
-
-
-
-
-
-
+    """Complex task model used by the experiments."""
 
     DEFAULT_CPI = 2.0
 
-    def __init__(self, uid, real_workload=None, real_cpi=None):
+    def __init__(self, uid, real_workload=None, real_cpi=None, subtasks=None):
         self.id = uid
 
         if real_workload is not None:
-            self.wk = real_workload
+            self.wk = float(real_workload)
         else:
-            self.wk = random.uniform(*WORKLOAD_RANGE)
-
+            self.wk = float(random.uniform(*WORKLOAD_RANGE))
 
         if real_cpi is not None:
-            self.cpi = real_cpi
+            self.cpi = float(real_cpi)
         else:
             self.cpi = Task.DEFAULT_CPI
 
+        if subtasks is None:
+            required_skills = _select_required_skills(uid, self.wk)
+            workloads = _split_workload(self.wk, len(required_skills))
+            self.subtasks = [
+                Subtask(uid, idx, skill, workloads[idx], self.cpi)
+                for idx, skill in enumerate(required_skills)
+            ]
+        else:
+            self.subtasks = list(subtasks)
+            self.wk = float(sum(st.wk for st in self.subtasks))
+
+        self.required_skills = tuple(st.skill for st in self.subtasks)
         self.deadline = DEADLINE
         self.base_val = 100.0
         self.tau_k = calc_tau(self.base_val, REVENUE_COST, REVENUE_DELTA, REVENUE_GAMMA)
@@ -555,7 +667,7 @@ def calc_cpi_efficiency(cpi):
     return efficiency
 
 
-def calc_dynamic_output(agent, task):
+def calc_dynamic_output(agent, work_item, skill=None):
 
 
 
@@ -568,8 +680,10 @@ def calc_dynamic_output(agent, task):
 
 
 
-    eta = calc_cpi_efficiency(task.cpi)
-    return agent.capacity * eta
+    skill = skill or getattr(work_item, "skill", None)
+    eta = calc_cpi_efficiency(getattr(work_item, "cpi", Task.DEFAULT_CPI))
+    skill_multiplier = agent.skill_efficiency.get(skill, 1.0) if skill else 1.0
+    return max(1e-9, agent.capacity * eta * skill_multiplier)
 
 
 
@@ -607,25 +721,165 @@ def calc_degradation(omega, concurrency, alpha):
     f = BETA_1 * omega + BETA_2 * omega**2 + BETA_3 * max(0, concurrency - 1)
     return alpha * f
 
+def _representative_skill(task, agent):
+    for skill in getattr(task, "required_skills", ()):
+        if agent.can_execute(skill):
+            return skill
+    return getattr(task, "required_skills", (None,))[0]
+
+
 def calc_real_time(task, agent, concurrency, omega):
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-    base_t = task.wk / calc_dynamic_output(agent, task)
+    skill = getattr(task, "skill", None)
+    if skill is None and hasattr(task, "required_skills"):
+        skill = _representative_skill(task, agent)
+    base_t = task.wk / calc_dynamic_output(agent, task, skill=skill)
     alpha = get_alpha(agent)
     degradation = calc_degradation(omega, concurrency, alpha)
     return base_t * (1 + degradation)
+
+
+def calc_subtask_real_time(subtask, agent, concurrency, omega):
+    base_t = subtask.wk / calc_dynamic_output(agent, subtask, skill=subtask.skill)
+    alpha = get_alpha(agent)
+    degradation = calc_degradation(omega, concurrency, alpha)
+    return base_t * (1 + degradation)
+
+
+def assignment_load(record, agent=None):
+    target_agent = agent or record.agent
+    return record.subtask.wk / target_agent.capacity
+
+
+def clone_assignment(assignment):
+    return {agent_id: list(records) for agent_id, records in assignment.items()}
+
+
+def task_records_from_assignment(assignment, task):
+    return [
+        record
+        for records in assignment.values()
+        for record in records
+        if record.task.id == task.id
+    ]
+
+
+def task_records_from_agents(agents, task):
+    return [
+        record
+        for agent in agents
+        for record in agent.concurrent_tasks
+        if record.task.id == task.id
+    ]
+
+
+def task_is_covered(task, records):
+    assigned = {record.subtask.key for record in records if record.task.id == task.id}
+    required = {subtask.key for subtask in task.subtasks}
+    return required <= assigned
+
+
+def assigned_agent_ids_for_task(assignment, task):
+    return {
+        record.agent.id
+        for records in assignment.values()
+        for record in records
+        if record.task.id == task.id
+    }
+
+
+def _agent_load_from_records(agent, records):
+    return sum(assignment_load(record, agent) for record in records)
+
+
+def _projected_assignment(assignment, records_to_add):
+    projected = clone_assignment(assignment)
+    for record in records_to_add:
+        projected.setdefault(record.agent.id, []).append(record)
+    return projected
+
+
+def calc_task_completion_time(task, records, assignment=None):
+    if not task_is_covered(task, records):
+        return float("inf")
+
+    times = []
+    for record in records:
+        if record.task.id != task.id:
+            continue
+        if assignment is not None:
+            agent_records = assignment.get(record.agent.id, [])
+            concurrency = len(agent_records)
+            omega = _agent_load_from_records(record.agent, agent_records)
+        else:
+            concurrency = len(record.agent.concurrent_tasks)
+            omega = record.agent.current_load
+        times.append(calc_subtask_real_time(record.subtask, record.agent, concurrency, omega))
+
+    return max(times) if times else float("inf")
+
+
+def calc_task_revenue(task, records, assignment=None):
+    if not task_is_covered(task, records):
+        return 0.0
+    completion_time = calc_task_completion_time(task, records, assignment=assignment)
+    if not np.isfinite(completion_time):
+        return 0.0
+    return calc_revenue(task, None, 1, completion_time=completion_time)
+
+
+def _append_record(assignment, record):
+    assignment.setdefault(record.agent.id, []).append(record)
+
+
+def _remove_record(assignment, record):
+    records = assignment.get(record.agent.id, [])
+    for idx, existing in enumerate(records):
+        if existing.task.id == record.task.id and existing.subtask.id == record.subtask.id:
+            del records[idx]
+            return True
+    return False
+
+
+def remove_task_from_assignment(assignment, task_id):
+    removed = []
+    for agent_id, records in assignment.items():
+        keep = []
+        for record in records:
+            if record.task.id == task_id:
+                removed.append(record)
+            else:
+                keep.append(record)
+        assignment[agent_id] = keep
+    return removed
+
+
+def rebuild_agent_state(agents, assignment):
+    for agent in agents:
+        agent.reset()
+        for record in assignment.get(agent.id, []):
+            live_record = SubtaskAssignment(record.task, record.subtask, agent)
+            agent.current_load += assignment_load(live_record, agent)
+            agent.concurrent_tasks.append(live_record)
+
+
+def add_live_assignment(agent, task, subtask):
+    record = SubtaskAssignment(task, subtask, agent)
+    agent.current_load += assignment_load(record, agent)
+    agent.concurrent_tasks.append(record)
+    return record
+
+
+def remove_live_records(agents, records):
+    keys = {(record.agent.id, record.task.id, record.subtask.id) for record in records}
+    for agent in agents:
+        kept = []
+        for record in agent.concurrent_tasks:
+            if (agent.id, record.task.id, record.subtask.id) in keys:
+                agent.current_load -= assignment_load(record, agent)
+            else:
+                kept.append(record)
+        agent.concurrent_tasks = kept
+        agent.current_load = max(0.0, agent.current_load)
 
 
 def create_tasks_from_real_data(n_tasks, real_data=None):
@@ -702,7 +956,7 @@ def calc_tau(base_val, cost, delta, gamma):
     tau_k = (1.0 / delta) * math.log(inner / (1.0 - inner))
     return tau_k
 
-def calc_revenue(task, agent, concurrency, omega=None):
+def calc_revenue(task, agent, concurrency, omega=None, completion_time=None):
 
 
 
@@ -729,10 +983,12 @@ def calc_revenue(task, agent, concurrency, omega=None):
 
 
     import math
-    if omega is None:
+    if omega is None and agent is not None:
         omega = agent.current_load
 
-    real_t = calc_real_time(task, agent, concurrency, omega)
+    real_t = completion_time
+    if real_t is None:
+        real_t = calc_real_time(task, agent, concurrency, omega)
 
 
     effective_deadline = task.deadline - task.tau_k
@@ -753,7 +1009,7 @@ def calc_utility(task, agent, concurrency, omega=None):
 # Task assignment strategy
 
 
-def tas_find_agent(task, agents, assignment, skip_congestion=False):
+def _legacy_tas_find_agent(task, agents, assignment, skip_congestion=False):
 
 
 
@@ -819,10 +1075,92 @@ def tas_find_agent(task, agents, assignment, skip_congestion=False):
     return best_agent
 
 
+def _score_subtask_agent(subtask, agent, agent_records, skip_congestion=False):
+    current_load = _agent_load_from_records(agent, agent_records)
+    omega = subtask.wk / agent.capacity
+    if current_load + omega > 1.0:
+        return None
+
+    new_conc = len(agent_records) + 1
+    new_total_load = current_load + omega
+    if skip_congestion:
+        return calc_dynamic_output(agent, subtask, skill=subtask.skill) / max(1.0, agent.capacity)
+
+    real_t = calc_subtask_real_time(subtask, agent, new_conc, new_total_load)
+    time_margin = max(0.0, (DEADLINE - real_t) / DEADLINE)
+    load_penalty = current_load * 0.35
+    conc_penalty = max(0, new_conc - 1) * 0.12
+    skill_bonus = agent.skill_efficiency.get(subtask.skill, 0.0) * 0.15
+    return time_margin + skill_bonus - load_penalty - conc_penalty
+
+
+def find_agent_for_subtask(task, subtask, agents, assignment, tentative=None, tabu=None,
+                           skip_congestion=False, random_choice=False):
+    tentative = tentative or []
+    tabu = tabu or set()
+    used_agents = assigned_agent_ids_for_task(assignment, task)
+    used_agents.update(record.agent.id for record in tentative if record.task.id == task.id)
+
+    candidates = []
+    for agent in agents:
+        if agent.id in used_agents or agent.id in tabu or not agent.can_execute(subtask.skill):
+            continue
+        agent_records = list(assignment.get(agent.id, []))
+        agent_records.extend(record for record in tentative if record.agent.id == agent.id)
+        score = _score_subtask_agent(
+            subtask, agent, agent_records, skip_congestion=skip_congestion
+        )
+        if score is not None:
+            candidates.append((score, agent))
+
+    if not candidates:
+        return None
+    if random_choice:
+        return random.choice(candidates)[1]
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    return candidates[0][1]
+
+
+def tas_find_group(task, agents, assignment, skip_congestion=False, tabu=None,
+                   random_choice=False):
+    tentative = []
+    tabu = tabu or set()
+    for subtask in sorted(task.subtasks, key=lambda st: st.wk, reverse=True):
+        agent = find_agent_for_subtask(
+            task,
+            subtask,
+            agents,
+            assignment,
+            tentative=tentative,
+            tabu=tabu,
+            skip_congestion=skip_congestion,
+            random_choice=random_choice,
+        )
+        if agent is None:
+            return None
+        tentative.append(SubtaskAssignment(task, subtask, agent))
+
+    projected = _projected_assignment(assignment, tentative)
+    task_rev = calc_task_revenue(task, tentative, assignment=projected)
+    if not skip_congestion and task_rev <= 0:
+        return None
+    return tentative
+
+
+def commit_group_assignment(assignment, group):
+    for record in group:
+        _append_record(assignment, record)
+
+
+def tas_find_agent(task, agents, assignment, skip_congestion=False):
+    group = tas_find_group(task, agents, assignment, skip_congestion=skip_congestion)
+    return group[0].agent if group else None
+
+
 # DyLAN baseline
 
 
-class DyLAN:
+class _LegacyDyLAN:
     """DyLAN baseline implementation."""
 
 
@@ -1132,7 +1470,7 @@ class DyLAN:
 
 # CHASE algorithm
 
-def run_CHASE_full(agents, tasks):
+def _legacy_run_CHASE_full(agents, tasks):
 
 
 
@@ -1282,7 +1620,7 @@ def run_CHASE_full(agents, tasks):
 
 # CHASE ablation variants
 
-def run_CHASE_ablation(agents, tasks, skip_congestion=False, skip_repick=False, random_drop=False):
+def _legacy_run_CHASE_ablation(agents, tasks, skip_congestion=False, skip_repick=False, random_drop=False):
 
 
 
@@ -1419,7 +1757,7 @@ def run_CHASE_ablation(agents, tasks, skip_congestion=False, skip_repick=False, 
 
     return assignment
 
-def run_algorithm(mode, agents, tasks):
+def _legacy_run_algorithm(mode, agents, tasks):
     for ag in agents: ag.reset()
     start_time = time.perf_counter()
     total_revenue = 0
@@ -1555,6 +1893,430 @@ def run_algorithm(mode, agents, tasks):
         'time': end_time,
         'utilization': avg_util,
         'concurrency': avg_conc
+    }
+
+
+def _empty_assignment(agents):
+    return {agent.id: [] for agent in agents}
+
+
+def _unique_tasks(records):
+    tasks_by_id = {}
+    for record in records:
+        tasks_by_id[record.task.id] = record.task
+    return list(tasks_by_id.values())
+
+
+def _task_revenue_from_assignment(task, assignment):
+    return calc_task_revenue(task, task_records_from_assignment(assignment, task), assignment)
+
+
+def _agent_joint_revenue(agent_id, assignment):
+    records = assignment.get(agent_id, [])
+    return sum(_task_revenue_from_assignment(task, assignment) for task in _unique_tasks(records))
+
+
+def _agent_exclusive_benchmark(agent_id, assignment):
+    records = assignment.get(agent_id, [])
+    if not records:
+        return 0.0
+
+    values = []
+    for record in records:
+        temp = clone_assignment(assignment)
+        temp[agent_id] = [record]
+        values.append(_task_revenue_from_assignment(record.task, temp))
+    return max(values) if values else 0.0
+
+
+def _agent_load(agent_id, agent, assignment):
+    return _agent_load_from_records(agent, assignment.get(agent_id, []))
+
+
+def _agent_is_safe(agent_id, agent, assignment):
+    records = assignment.get(agent_id, [])
+    if len(records) <= 1:
+        return True
+    load = _agent_load(agent_id, agent, assignment)
+    return load <= 1.0 and _agent_joint_revenue(agent_id, assignment) > _agent_exclusive_benchmark(
+        agent_id, assignment
+    )
+
+
+def _record_marginal_value(record, assignment):
+    involved_tasks = _unique_tasks(assignment.get(record.agent.id, []))
+    current = sum(_task_revenue_from_assignment(task, assignment) for task in involved_tasks)
+    temp = clone_assignment(assignment)
+    _remove_record(temp, record)
+    after = sum(_task_revenue_from_assignment(task, temp) for task in involved_tasks)
+    return current - after
+
+
+def _replace_or_remove_record(record, agents, assignment, tabu, skip_repick=False):
+    _remove_record(assignment, record)
+    tabu[record.task.id].add(record.agent.id)
+
+    if skip_repick:
+        removed = remove_task_from_assignment(assignment, record.task.id)
+        return removed, set()
+
+    replacement_agent = find_agent_for_subtask(
+        record.task,
+        record.subtask,
+        agents,
+        assignment,
+        tabu=tabu[record.task.id],
+        skip_congestion=False,
+    )
+    if replacement_agent is None:
+        removed = remove_task_from_assignment(assignment, record.task.id)
+        return removed + [record], {record.agent.id}
+
+    replacement = SubtaskAssignment(record.task, record.subtask, replacement_agent)
+    _append_record(assignment, replacement)
+    return [record], {record.agent.id, replacement_agent.id}
+
+
+def _run_chase_group(agents, tasks, skip_congestion=False, skip_repick=False, random_drop=False):
+    assignment = _empty_assignment(agents)
+    tabu = defaultdict(set)
+
+    for task in tasks:
+        group = tas_find_group(
+            task,
+            agents,
+            assignment,
+            skip_congestion=skip_congestion,
+        )
+        if group:
+            commit_group_assignment(assignment, group)
+
+    if skip_congestion:
+        rebuild_agent_state(agents, assignment)
+        return assignment
+
+    agent_map = {agent.id: agent for agent in agents}
+    agents_to_check = set(agent_map)
+    conflict_set = set()
+
+    for _ in range(100):
+        for agent_id in list(agents_to_check):
+            if not _agent_is_safe(agent_id, agent_map[agent_id], assignment):
+                conflict_set.add(agent_id)
+        agents_to_check.clear()
+
+        if not conflict_set:
+            break
+
+        for agent_id in list(conflict_set):
+            agent = agent_map[agent_id]
+            while len(assignment.get(agent_id, [])) > 1 and not _agent_is_safe(
+                agent_id, agent, assignment
+            ):
+                records = list(assignment.get(agent_id, []))
+                if random_drop:
+                    dropped = random.choice(records)
+                else:
+                    dropped = min(records, key=lambda rec: _record_marginal_value(rec, assignment))
+                _, changed_agents = _replace_or_remove_record(
+                    dropped,
+                    agents,
+                    assignment,
+                    tabu,
+                    skip_repick=skip_repick,
+                )
+                agents_to_check.update(changed_agents)
+                agents_to_check.add(agent_id)
+        conflict_set.clear()
+
+    rebuild_agent_state(agents, assignment)
+    return assignment
+
+
+def run_CHASE_full(agents, tasks):
+    return _run_chase_group(agents, tasks)
+
+
+def run_CHASE_ablation(agents, tasks, skip_congestion=False, skip_repick=False, random_drop=False):
+    return _run_chase_group(
+        agents,
+        tasks,
+        skip_congestion=skip_congestion,
+        skip_repick=skip_repick,
+        random_drop=random_drop,
+    )
+
+
+class Baseline_BRTOA:
+    """Best-response baseline over complete task groups."""
+
+    def __init__(self, agents, tasks):
+        self.agents = agents
+        self.tasks = tasks
+        self.max_iterations = 3000
+
+    def run(self):
+        assignment = _empty_assignment(self.agents)
+        for task in self.tasks:
+            group = tas_find_group(task, self.agents, assignment)
+            if group:
+                commit_group_assignment(assignment, group)
+
+        for _ in range(self.max_iterations):
+            update_requests = []
+            for task in self.tasks:
+                current_value = _task_revenue_from_assignment(task, assignment)
+                temp = clone_assignment(assignment)
+                remove_task_from_assignment(temp, task.id)
+                candidate_group = tas_find_group(task, self.agents, temp)
+                if not candidate_group:
+                    continue
+                projected = _projected_assignment(temp, candidate_group)
+                candidate_value = _task_revenue_from_assignment(task, projected)
+                if candidate_value > current_value + 1e-6:
+                    update_requests.append((task, candidate_group))
+
+            if not update_requests:
+                break
+
+            task, candidate_group = random.choice(update_requests)
+            remove_task_from_assignment(assignment, task.id)
+            commit_group_assignment(assignment, candidate_group)
+
+        return assignment
+
+
+def _mct_find_group(task, agents, assignment):
+    tentative = []
+    for subtask in sorted(task.subtasks, key=lambda st: st.wk, reverse=True):
+        used_agents = assigned_agent_ids_for_task(assignment, task)
+        used_agents.update(record.agent.id for record in tentative)
+        best_agent = None
+        best_time = float("inf")
+        for agent in agents:
+            if agent.id in used_agents or not agent.can_execute(subtask.skill):
+                continue
+            agent_records = list(assignment.get(agent.id, []))
+            agent_records.extend(record for record in tentative if record.agent.id == agent.id)
+            current_load = _agent_load_from_records(agent, agent_records)
+            omega = subtask.wk / agent.capacity
+            if current_load + omega > 1.0:
+                continue
+            est_time = calc_subtask_real_time(
+                subtask, agent, len(agent_records) + 1, current_load + omega
+            )
+            if est_time < best_time:
+                best_agent = agent
+                best_time = est_time
+        if best_agent is None:
+            return None
+        tentative.append(SubtaskAssignment(task, subtask, best_agent))
+    return tentative
+
+
+def _run_group_greedy(agents, tasks, *, random_choice=False, mct=False):
+    assignment = _empty_assignment(agents)
+    scheduled_tasks = list(tasks)
+    if random_choice:
+        random.shuffle(scheduled_tasks)
+    else:
+        scheduled_tasks.sort(key=lambda task: task.wk)
+
+    for task in scheduled_tasks:
+        if mct:
+            group = _mct_find_group(task, agents, assignment)
+        else:
+            group = tas_find_group(
+                task,
+                agents,
+                assignment,
+                skip_congestion=random_choice,
+                random_choice=random_choice,
+            )
+        if group:
+            commit_group_assignment(assignment, group)
+
+    rebuild_agent_state(agents, assignment)
+    return assignment
+
+
+def _feasible_mask_for_subtask(task, subtask, agents, used_agent_ids):
+    mask = np.zeros(len(agents), dtype=bool)
+    for idx, agent in enumerate(agents):
+        omega = subtask.wk / agent.capacity
+        if (
+            agent.id not in used_agent_ids
+            and agent.can_execute(subtask.skill)
+            and agent.current_load + omega <= 1.0
+        ):
+            mask[idx] = True
+    return mask
+
+
+def _run_fldrl_group(agents, tasks):
+    fl_drl_model = get_fl_drl_model()
+    for task in sorted(tasks, key=lambda t: t.wk):
+        used_agent_ids = set()
+        task_records = []
+        failed = False
+        for idx, subtask in enumerate(task.subtasks):
+            progress = idx / max(1, len(task.subtasks))
+            state = fl_drl_model.build_state(task, subtask, agents, progress=progress)
+            feasible_mask = _feasible_mask_for_subtask(task, subtask, agents, used_agent_ids)
+            selected_idx = fl_drl_model.choose_action(state, feasible_mask)
+            if selected_idx is None:
+                failed = True
+                break
+            target_agent = agents[selected_idx]
+            if not feasible_mask[selected_idx]:
+                failed = True
+                break
+            task_records.append(add_live_assignment(target_agent, task, subtask))
+            used_agent_ids.add(target_agent.id)
+
+        if failed:
+            remove_live_records(agents, task_records)
+
+
+class DyLAN:
+    """DyLAN-style iterative active-agent selection with group-aware scheduling."""
+
+    def __init__(self, agents, tasks, T_max=5, top_k=None, consistency_theta=2 / 3):
+        self.agents = list(agents)
+        self.tasks = list(tasks)
+        self.T_max = T_max
+        self.top_k = top_k if top_k is not None else max(1, len(agents) // 2)
+        self.theta = consistency_theta
+        self.V_layers = []
+        self.E_layers = []
+        self.messages = []
+
+    def _schedule_on_active_agents(self, active_agents):
+        assignment = {agent.id: [] for agent in active_agents}
+        for task in sorted(self.tasks, key=lambda t: t.wk):
+            group = _mct_find_group(task, active_agents, assignment)
+            if group:
+                commit_group_assignment(assignment, group)
+        return assignment
+
+    def _messages_for_assignment(self, active_agents, assignment):
+        messages = {}
+        for agent in active_agents:
+            messages[agent.id] = {
+                "revenue": _agent_joint_revenue(agent.id, assignment),
+                "assignment": assignment.get(agent.id, []),
+            }
+        return messages
+
+    def _llm_ranker(self, active_agents, messages):
+        scored = [(messages.get(agent.id, {}).get("revenue", 0.0), agent) for agent in active_agents]
+        scored.sort(key=lambda item: item[0], reverse=True)
+        return scored
+
+    def _check_consistency(self, active_agents, assignment):
+        if not active_agents:
+            return True
+        loads = [_agent_load(agent.id, agent, assignment) for agent in active_agents]
+        mean_load = sum(loads) / len(loads)
+        consistent = sum(1 for load in loads if abs(load - mean_load) < 0.10)
+        return (consistent / len(active_agents)) >= self.theta
+
+    def run_task_solving(self):
+        active_agents = list(self.agents)
+        last_assignment = _empty_assignment(self.agents)
+        self.V_layers = [list(active_agents)]
+        self.messages = [{}]
+
+        for _ in range(self.T_max):
+            assignment = self._schedule_on_active_agents(active_agents)
+            messages = self._messages_for_assignment(active_agents, assignment)
+            self.messages.append(messages)
+            last_assignment = _empty_assignment(self.agents)
+            for agent in active_agents:
+                last_assignment[agent.id] = list(assignment.get(agent.id, []))
+
+            ranked = self._llm_ranker(active_agents, messages)
+            top_agents = [agent for _, agent in ranked[:self.top_k]]
+            self.E_layers.append({(agent.id, top.id) for agent in active_agents for top in top_agents})
+            self.V_layers.append(list(top_agents))
+
+            if self._check_consistency(active_agents, assignment):
+                break
+            active_agents = top_agents
+
+        rebuild_agent_state(self.agents, last_assignment)
+        return {agent.id: agent.concurrent_tasks for agent in self.agents}
+
+    def run_team_optimization(self, k=None):
+        if k is None:
+            k = self.top_k
+        influence = {agent.id: 0.0 for agent in self.agents}
+        for agent in self.agents:
+            influence[agent.id] = sum(
+                calc_task_revenue(record.task, task_records_from_agents(self.agents, record.task))
+                for record in agent.concurrent_tasks
+            )
+        ranked = sorted(self.agents, key=lambda agent: influence.get(agent.id, 0.0), reverse=True)
+        return ranked[:k], influence
+
+
+def _collect_task_metrics(agents, tasks):
+    total_revenue = 0.0
+    success_count = 0
+    for task in tasks:
+        records = task_records_from_agents(agents, task)
+        revenue = calc_task_revenue(task, records)
+        total_revenue += revenue
+        if revenue > 0:
+            success_count += 1
+    return total_revenue, success_count
+
+
+def run_algorithm(mode, agents, tasks):
+    for agent in agents:
+        agent.reset()
+    start_time = time.perf_counter()
+
+    if mode == "IRS":
+        _run_group_greedy(agents, tasks, random_choice=True)
+    elif mode == "CHASE":
+        run_CHASE_full(agents, tasks)
+    elif mode == "CHASE_NO_CONG":
+        run_CHASE_ablation(agents, tasks, skip_congestion=True)
+    elif mode == "CHASE_NO_REPICK":
+        run_CHASE_ablation(agents, tasks, skip_repick=True)
+    elif mode == "CHASE_NO_SMART":
+        run_CHASE_ablation(agents, tasks, random_drop=True)
+    elif mode == "FL_DRL":
+        _run_fldrl_group(agents, tasks)
+    elif mode == "BRTOA":
+        assignment = Baseline_BRTOA(agents, tasks).run()
+        rebuild_agent_state(agents, assignment)
+    elif mode == "MCT":
+        _run_group_greedy(agents, tasks, mct=True)
+    elif mode == "DyLAN":
+        DyLAN(agents, tasks).run_task_solving()
+    else:
+        raise ValueError(f"Unknown algorithm mode: {mode}")
+
+    total_revenue, success_count = _collect_task_metrics(agents, tasks)
+    end_time = (time.perf_counter() - start_time) * 1000
+
+    utilization = {"High": [], "Mid": [], "Low": []}
+    concurrency_counts = {"High": [], "Mid": [], "Low": []}
+    for agent in agents:
+        utilization.setdefault(agent.type, []).append(agent.current_load)
+        concurrency_counts.setdefault(agent.type, []).append(len(agent.concurrent_tasks))
+
+    avg_util = {key: np.mean(value) if value else 0 for key, value in utilization.items()}
+    avg_conc = {key: np.mean(value) if value else 0 for key, value in concurrency_counts.items()}
+
+    return {
+        "revenue": total_revenue,
+        "success_rate": success_count / len(tasks) if tasks else 0,
+        "time": end_time,
+        "utilization": avg_util,
+        "concurrency": avg_conc,
     }
 
 
