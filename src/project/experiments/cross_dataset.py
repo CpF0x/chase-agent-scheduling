@@ -53,14 +53,32 @@ LABELS = {
     'FL_DRL': 'FL-DRL',          'BRTOA': 'BRTOA',
 }
 
-# Worker returns both metrics
-def _worker(trial_idx, alg, n_task, alibaba_data, real_agent_dist):
+def _clone_agents(agents):
+    return [
+        M.Agent(
+            ag.id,
+            ag.type,
+            ag.capacity,
+            ag.output,
+            skills=ag.skills,
+            skill_efficiency=ag.skill_efficiency,
+        )
+        for ag in agents
+    ]
+
+
+# Worker returns all algorithm metrics for one shared trial scenario.
+def _worker(trial_idx, n_task, alibaba_data, real_agent_dist):
     random.seed()
     np.random.seed()
-    agents = M.create_agents_from_real_data(N_AGENTS, real_distribution=real_agent_dist)
-    tasks  = M.create_tasks_from_real_data(n_task, real_data=alibaba_data)
-    res    = M.run_algorithm(alg, agents, tasks)
-    return res['revenue'], res['success_rate']
+    base_agents = M.create_agents_from_real_data(N_AGENTS, real_distribution=real_agent_dist)
+    tasks = M.create_tasks_from_real_data(n_task, real_data=alibaba_data)
+
+    trial_results = {}
+    for alg in ALGS:
+        res = M.run_algorithm(alg, _clone_agents(base_agents), tasks)
+        trial_results[alg] = (res['revenue'], res['success_rate'])
+    return trial_results
 
 
 def run_experiment(pool, alibaba_data, real_agent_dist):
@@ -79,15 +97,15 @@ def run_experiment(pool, alibaba_data, real_agent_dist):
 
     for n_task in TASK_NUM_RANGE:
         print(f"  Tasks={n_task} ...", flush=True)
-        for alg in ALGS:
-            fn = partial(_worker,
-                         alg=alg, n_task=n_task,
-                         alibaba_data=alibaba_data,
-                         real_agent_dist=real_agent_dist)
-            trial_out = pool.map(fn, range(N_TRIALS))
+        fn = partial(_worker,
+                     n_task=n_task,
+                     alibaba_data=alibaba_data,
+                     real_agent_dist=real_agent_dist)
+        trial_out = pool.map(fn, range(N_TRIALS))
 
-            revs  = np.array([r for r, _ in trial_out])
-            succs = np.array([s for _, s in trial_out])
+        for alg in ALGS:
+            revs  = np.array([trial[alg][0] for trial in trial_out])
+            succs = np.array([trial[alg][1] for trial in trial_out])
 
             results[alg]['rev_means'].append(float(revs.mean()))
             results[alg]['rev_stds'].append(float(revs.std()))
@@ -209,8 +227,8 @@ def plot_all(results):
 def main():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-    print(">>> Loading Alibaba synthetic data...")
-    alibaba_data = M.load_alibaba_synthetic_data()
+    print(">>> Loading Alibaba cluster trace data...")
+    alibaba_data = M.load_alibaba_trace_data()
 
     print(">>> Loading agent distribution from Borg trace...")
     agent_dist = M.load_agent_distribution()
