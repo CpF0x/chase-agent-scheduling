@@ -39,7 +39,7 @@ from project.experiments import main_experiment as M
 # Experiment settings
 N_TASK   = 80
 N_AGENTS = 40
-N_TRIALS = 30
+N_TRIALS = 50
 
 
 DELTA_SWEEP = [5, 10, 20, 30, 50, 80]
@@ -201,24 +201,23 @@ def plot_heatmap(delta_vals, gamma_vals, rev_grid, fname):
 
 
     bi, bj = np.unravel_index(np.argmax(rev_grid), rev_grid.shape)
-    ax.plot(bi + 0.5, bj + 0.5, marker='*', markersize=22,
+    ax.plot(bi + 0.68, bj + 0.32, marker='*', markersize=18,
             markerfacecolor='none', markeredgecolor='white', markeredgewidth=1.8,
             label=f'Best: δ={delta_vals[bi]}, γ={gamma_vals[bj]}', zorder=5)
 
 
     ci = delta_vals.index(DELTA_BASE)
     cj = gamma_vals.index(GAMMA_BASE)
-    ax.plot(ci + 0.5, cj + 0.5, marker='D', markersize=14,
+    ax.plot(ci + 0.68, cj + 0.32, marker='D', markersize=11,
             markerfacecolor='none', markeredgecolor='#90CAF9', markeredgewidth=2.0,
             label=f'Chosen: δ={int(DELTA_BASE)}, γ={GAMMA_BASE}', zorder=5)
 
-    ax.legend(fontsize=10, loc='upper right',
-              frameon=True, facecolor='white', framealpha=0.85)
+    ax.legend(fontsize=10, loc='upper center', bbox_to_anchor=(0.5, -0.16),
+              ncol=2, frameon=True, facecolor='white', framealpha=0.9,
+              borderaxespad=0.2)
 
     ax.set_title(
-        f'Sensitivity Heatmap: CHASE Mean Revenue vs ($\\delta$, $\\gamma$)\n'
-        f'(Fixed $\\tau_k$={_BASE_TAU_K:.4f}, Tasks={N_TASK}, Agents={N_AGENTS}, '
-        f'{N_TRIALS} trials)',
+        f'Sensitivity Heatmap: CHASE Mean Revenue vs ($\\delta$, $\\gamma$)',
         fontsize=12, pad=10)
 
     plt.tight_layout()
