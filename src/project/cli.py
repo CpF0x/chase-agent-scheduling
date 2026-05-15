@@ -11,7 +11,7 @@ def main(argv: list[str] | None = None) -> None:
         "command",
         nargs="?",
         default="main",
-        choices=["main", "timecost", "cross-dataset", "sensitivity", "fig1"],
+        choices=["main", "high-pressure", "timecost", "cross-dataset", "sensitivity", "fig1"],
         help="Experiment to run.",
     )
     parser.add_argument(
@@ -30,6 +30,14 @@ def main(argv: list[str] | None = None) -> None:
         data = main_experiment.run_full_experiment()
         main_experiment.plot_results(data)
         main_experiment.export_statistics_tables(data)
+        return
+
+    if args.command == "high-pressure":
+        from project.experiments import main_experiment
+
+        main_experiment.run_high_pressure_experiment(
+            num_trials=5 if args.quick else main_experiment.HIGH_PRESSURE_TRIALS
+        )
         return
 
     if args.command == "timecost":

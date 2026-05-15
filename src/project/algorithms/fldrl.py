@@ -15,6 +15,8 @@ torch.set_num_threads(1)
 import torch.nn as nn
 import numpy as np
 
+SKILL_NAMES = ("sense", "preprocess", "infer", "aggregate", "actuate")
+
 
 class DDQNNetwork(nn.Module):
     """Two-layer DDQN network."""
@@ -63,6 +65,16 @@ class FLDRLInference:
         action_dim = checkpoint['action_dim']
         hidden_size = checkpoint.get('hidden_size', 200)
         self.n_agents = checkpoint['n_agents']
+        self.skill_names = tuple(checkpoint.get('skill_names', ()))
+
+        expected_state_dim = 2 + len(SKILL_NAMES) + 1 + 3 * self.n_agents
+        if self.skill_names != SKILL_NAMES or state_dim != expected_state_dim:
+            raise ValueError(
+                "FL-DRL 模型接口已升级为技能/子任务状态。"
+                "请重新运行 drl_train.py 训练模型，并确保 checkpoint 包含 skill_names、"
+                f"state_dim={expected_state_dim}。当前 checkpoint: "
+                f"skill_names={self.skill_names}, state_dim={state_dim}。"
+            )
 
         self.model = DDQNNetwork(state_dim, action_dim, hidden_size)
         self.model.load_state_dict(checkpoint['model_state_dict'])
@@ -72,21 +84,14 @@ class FLDRLInference:
         print(f"  [FL-DRL] 模型加载成功: {model_path}")
         print(f"  [FL-DRL] 状态维度={state_dim}, 动作维度={action_dim}, 智能体数={self.n_agents}")
 
-    def build_state(self, task, agents):
-
-
-
-
-
-
-
-
-
-
-        state = [task.wk / 80.0, task.cpi / 4.0]
+    def build_state(self, task, subtask, agents, progress=0.0):
+        state = [subtask.wk / 80.0, subtask.cpi / 4.0]
+        state.extend(1.0 if subtask.skill == skill else 0.0 for skill in SKILL_NAMES)
+        state.append(float(progress))
         for ag in agents:
             state.append(ag.current_load)
             state.append(ag.capacity / 120.0)
+            state.append(1.0 if ag.can_execute(subtask.skill) else 0.0)
         return np.array(state, dtype=np.float32)
 
     def choose_action(self, state, feasible_mask):

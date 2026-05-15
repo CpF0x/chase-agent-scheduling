@@ -21,6 +21,7 @@ dist/
 
 
 # Experiment data, models, and generated artifacts
+data/alibaba_cluster_trace_v2018/
 data/*.csv
 models/*.pt
 outputs/
