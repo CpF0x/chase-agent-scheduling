@@ -207,7 +207,7 @@ def plot_all(results):
         y_means_dict={alg: results[alg]['rev_means'] for alg in ALGS},
         y_stds_dict ={alg: results[alg]['rev_stds']  for alg in ALGS},
         ylabel   = 'Total Revenue',
-        title    = 'Total Revenue vs. Number of Tasks\n(Alibaba Cluster Trace, Agents=40)',
+        title    = 'Total Revenue',
         filename = 'Fig_CrossDataset_Alibaba_Revenue.png',
     )
 
@@ -218,7 +218,7 @@ def plot_all(results):
         y_means_dict={alg: [v * 100 for v in results[alg]['succ_means']] for alg in ALGS},
         y_stds_dict ={alg: [v * 100 for v in results[alg]['succ_stds']]  for alg in ALGS},
         ylabel   = 'Success Rate (%)',
-        title    = 'Task Success Rate vs. Number of Tasks\n(Alibaba Cluster Trace, Agents=40)',
+        title    = 'Success Rate (%)',
         filename = 'Fig_CrossDataset_Alibaba_SuccRate.png',
     )
 

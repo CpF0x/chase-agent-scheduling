@@ -39,11 +39,29 @@ pip install -e .
 
 ## Required Local Files
 
-Put the full Borg trace CSV here:
+Put the full Borg trace CSV here for the main, time-cost, sensitivity, and
+agent-distribution experiments:
 
 ```text
 data/borg_traces_data.csv
 ```
+
+Put the Alibaba Cluster Trace v2018 batch-task file here for the cross-dataset
+experiment:
+
+```text
+data/alibaba_cluster_trace_v2018/batch_task.csv
+```
+
+The cross-dataset loader maps the raw Alibaba batch-task table into the local
+task model and caches the result here:
+
+```text
+data/alibaba_cluster_trace_v2018_mapped.csv
+```
+
+If the mapped CSV already exists, the cross-dataset experiment reuses it so the
+Alibaba workload mapping stays consistent across runs.
 
 Put the trained FL-DRL model here if running experiments that include FL-DRL:
 
@@ -51,8 +69,10 @@ Put the trained FL-DRL model here if running experiments that include FL-DRL:
 models/fl_drl_model.pt
 ```
 
-If the trace file is absent, the code falls back to synthetic/default samples
-where possible. FL-DRL runs require the model file.
+If the Borg trace is absent, the code falls back to synthetic/default samples
+where possible. If the Alibaba batch-task file is absent, the cross-dataset
+loader falls back to synthetic Alibaba-like samples. FL-DRL runs require the
+model file.
 
 ## Running Experiments
 
