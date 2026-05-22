@@ -89,12 +89,7 @@ python heatmap_sensitivity.py
 Generated figures are written to `outputs/figures/`; generated CSV tables are
 written to `outputs/tables/`.
 
-##  Note
 
-Due to hardware performance differences and other stochastic factors, the exact
-numerical results may vary slightly between experimental runs. However, the
-relative comparisons and overall performance trends among the algorithms remain
-consistent.
 
 ## Development Checks
 
